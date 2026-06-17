@@ -3,21 +3,18 @@
  *
  * Polls the VV: Ultimatum wiki Recent Changes RSS feed.
  * Posts any edits from the last 6 minutes to Discord.
- * No file cache needed — time-based filtering handles deduplication.
+ * Uses no external dependencies — just Node's built-in fetch and XML parsing.
  */
-
-const Parser = require("rss-parser");
 
 // ── CONFIG ────────────────────────────────────────────────────────────────────
 
 const RSS_URL =
   "https://vv-ultimatum.fandom.com/wiki/Special:RecentChanges?feed=rss";
 
-// Post edits newer than this many minutes (slightly more than the cron interval)
 const LOOKBACK_MINUTES = 6;
 
-const COLOR_EDIT = 0x5865f2; // blurple
-const COLOR_NEW  = 0x57f287; // green
+const COLOR_EDIT = 0x5865f2;
+const COLOR_NEW  = 0x57f287;
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -27,61 +24,84 @@ if (!webhookUrl) {
   process.exit(1);
 }
 
-async function postToDiscord(item) {
-  const isNew = (item.title || "").toLowerCase().includes("created");
+// Minimal XML field extractor — pulls the text content of the first matching tag
+function extractAll(xml, tag) {
+  const results = [];
+  const re = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, "g");
+  let match;
+  while ((match = re.exec(xml)) !== null) {
+    results.push(match[1].replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1").trim());
+  }
+  return results;
+}
 
-  const titleParts = (item.title || "Untitled").split(" - ");
-  const pageName = titleParts[0].trim();
-  const summary  = titleParts.slice(1).join(" - ").trim() || "*(no summary)*";
-  const editor   = item.creator || item.author || "Unknown";
+function parseRSS(xml) {
+  const titles    = extractAll(xml, "title").slice(1);  // skip channel title
+  const links     = extractAll(xml, "link").slice(1);
+  const dates     = extractAll(xml, "pubDate");
+  const creators  = extractAll(xml, "dc:creator");
+  const summaries = extractAll(xml, "description").slice(1);
+
+  return titles.map((title, i) => ({
+    title:     title,
+    link:      links[i]     || "",
+    pubDate:   dates[i]     || "",
+    creator:   creators[i]  || "Unknown",
+    summary:   summaries[i] || "",
+  }));
+}
+
+async function postToDiscord(item) {
+  const isNew = item.title.toLowerCase().includes("created");
+
+  const titleParts = item.title.split(" - ");
+  const pageName   = titleParts[0].trim();
+  const summary    = titleParts.slice(1).join(" - ").trim() || "*(no summary)*";
 
   const embed = {
     title: isNew ? `📄 New page: ${pageName}` : `✏️ Edited: ${pageName}`,
-    url: item.link || RSS_URL,
+    url:   item.link || RSS_URL,
     color: isNew ? COLOR_NEW : COLOR_EDIT,
     fields: [
-      { name: "Editor",       value: editor,  inline: true },
-      { name: "Edit Summary", value: summary, inline: true },
+      { name: "Editor",       value: item.creator, inline: true },
+      { name: "Edit Summary", value: summary,       inline: true },
     ],
-    footer: { text: "VV: Ultimatum Wiki" },
-    timestamp: item.isoDate || new Date().toISOString(),
+    footer:    { text: "VV: Ultimatum Wiki" },
+    timestamp: item.pubDate ? new Date(item.pubDate).toISOString() : new Date().toISOString(),
   };
 
   const res = await fetch(webhookUrl, {
-    method: "POST",
+    method:  "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ embeds: [embed] }),
+    body:    JSON.stringify({ embeds: [embed] }),
   });
 
   if (!res.ok) {
-    const text = await res.text();
-    console.error(`Discord error ${res.status}:`, text);
+    console.error(`Discord error ${res.status}:`, await res.text());
   }
 
-  // Respect Discord's rate limit (30 req/min)
+  // Respect Discord rate limit
   await new Promise((r) => setTimeout(r, 1000));
 }
 
 async function main() {
-  const parser = new Parser();
-  let feed;
+  const res = await fetch(RSS_URL, {
+    headers: { "User-Agent": "Mozilla/5.0 (compatible; VVWikiNotifier/1.0)" },
+  });
 
-  try {
-    feed = await parser.parseURL(RSS_URL, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; VVWikiNotifier/1.0)"
-      }
-    });
-  } catch (err) {
-    console.error("Failed to fetch RSS feed:", err.message);
+  if (!res.ok) {
+    console.error("Failed to fetch RSS feed:", res.status);
     process.exit(1);
   }
 
+  const xml   = await res.text();
+  const items = parseRSS(xml);
+
   const cutoff = new Date(Date.now() - LOOKBACK_MINUTES * 60 * 1000);
 
-  const newEntries = (feed.items || [])
-    .filter((item) => item.isoDate && new Date(item.isoDate) > cutoff)
-    .reverse(); // oldest first so Discord shows them in order
+  const newEntries = items
+    .filter((item) => item.pubDate && new Date(item.pubDate) > cutoff)
+    .reverse();
 
   if (newEntries.length === 0) {
     console.log("No new edits in the last", LOOKBACK_MINUTES, "minutes.");
@@ -98,4 +118,7 @@ async function main() {
   console.log("Done.");
 }
 
-main();
+main().catch((err) => {
+  console.error("Unexpected error:", err);
+  process.exit(1);
+});
