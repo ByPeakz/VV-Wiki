@@ -2,9 +2,8 @@ name: Wiki Edit Notifier
 
 on:
   schedule:
-    # Runs every 5 minutes
     - cron: "*/5 * * * *"
-  workflow_dispatch: # allows manual trigger from the Actions tab
+  workflow_dispatch:
 
 jobs:
   check-edits:
@@ -22,4 +21,5 @@ jobs:
       - name: Check RSS and notify Discord
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_MESSAGE_ID: ${{ vars.DISCORD_MESSAGE_ID }}
         run: node .github/scripts/notify.js
