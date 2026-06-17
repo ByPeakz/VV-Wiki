@@ -1,15 +1,16 @@
 /**
  * .github/scripts/notify.js
  *
- * Polls the VV: Ultimatum wiki Recent Changes RSS feed.
+ * Polls the VV: Ultimatum wiki Recent Changes via the MediaWiki API.
  * Posts any edits from the last 6 minutes to Discord.
- * Uses no external dependencies — just Node's built-in fetch and XML parsing.
+ * No external dependencies — uses Node's built-in fetch.
  */
 
 // ── CONFIG ────────────────────────────────────────────────────────────────────
 
-const RSS_URL =
-  "https://vv-ultimatum.fandom.com/wiki/Special:RecentChanges?feed=rss";
+// Using the MediaWiki API instead of RSS to avoid Fandom's bot blocking
+const API_URL =
+  "https://vv-ultimatum.fandom.com/api.php?action=query&list=recentchanges&rcprop=title|user|comment|timestamp|ids&rclimit=20&rctype=edit|new&format=json&origin=*";
 
 const LOOKBACK_MINUTES = 6;
 
@@ -24,50 +25,23 @@ if (!webhookUrl) {
   process.exit(1);
 }
 
-// Minimal XML field extractor — pulls the text content of the first matching tag
-function extractAll(xml, tag) {
-  const results = [];
-  const re = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, "g");
-  let match;
-  while ((match = re.exec(xml)) !== null) {
-    results.push(match[1].replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1").trim());
-  }
-  return results;
-}
-
-function parseRSS(xml) {
-  const titles    = extractAll(xml, "title").slice(1);  // skip channel title
-  const links     = extractAll(xml, "link").slice(1);
-  const dates     = extractAll(xml, "pubDate");
-  const creators  = extractAll(xml, "dc:creator");
-  const summaries = extractAll(xml, "description").slice(1);
-
-  return titles.map((title, i) => ({
-    title:     title,
-    link:      links[i]     || "",
-    pubDate:   dates[i]     || "",
-    creator:   creators[i]  || "Unknown",
-    summary:   summaries[i] || "",
-  }));
-}
-
-async function postToDiscord(item) {
-  const isNew = item.title.toLowerCase().includes("created");
-
-  const titleParts = item.title.split(" - ");
-  const pageName   = titleParts[0].trim();
-  const summary    = titleParts.slice(1).join(" - ").trim() || "*(no summary)*";
+async function postToDiscord(change) {
+  const isNew    = change.type === "new";
+  const pageName = change.title;
+  const editor   = change.user    || "Unknown";
+  const summary  = change.comment || "*(no summary)*";
+  const pageUrl  = `https://vv-ultimatum.fandom.com/wiki/${encodeURIComponent(pageName.replace(/ /g, "_"))}`;
 
   const embed = {
     title: isNew ? `📄 New page: ${pageName}` : `✏️ Edited: ${pageName}`,
-    url:   item.link || RSS_URL,
+    url:   pageUrl,
     color: isNew ? COLOR_NEW : COLOR_EDIT,
     fields: [
-      { name: "Editor",       value: item.creator, inline: true },
-      { name: "Edit Summary", value: summary,       inline: true },
+      { name: "Editor",       value: editor,  inline: true },
+      { name: "Edit Summary", value: summary, inline: true },
     ],
     footer:    { text: "VV: Ultimatum Wiki" },
-    timestamp: item.pubDate ? new Date(item.pubDate).toISOString() : new Date().toISOString(),
+    timestamp: change.timestamp || new Date().toISOString(),
   };
 
   const res = await fetch(webhookUrl, {
@@ -80,28 +54,36 @@ async function postToDiscord(item) {
     console.error(`Discord error ${res.status}:`, await res.text());
   }
 
-  // Respect Discord rate limit
+  // Respect Discord rate limit (30 req/min)
   await new Promise((r) => setTimeout(r, 1000));
 }
 
 async function main() {
-  const res = await fetch(RSS_URL, {
-    headers: { "User-Agent": "Mozilla/5.0 (compatible; VVWikiNotifier/1.0)" },
+  const res = await fetch(API_URL, {
+    headers: {
+      "User-Agent": "VVWikiNotifier/1.0 (GitHub Actions; vv-ultimatum.fandom.com)",
+      "Accept":     "application/json",
+    },
   });
 
   if (!res.ok) {
-    console.error("Failed to fetch RSS feed:", res.status);
+    console.error("Failed to fetch from MediaWiki API:", res.status);
     process.exit(1);
   }
 
-  const xml   = await res.text();
-  const items = parseRSS(xml);
+  const data = await res.json();
+  const changes = data?.query?.recentchanges || [];
+
+  if (changes.length === 0) {
+    console.log("No recent changes returned by API.");
+    return;
+  }
 
   const cutoff = new Date(Date.now() - LOOKBACK_MINUTES * 60 * 1000);
 
-  const newEntries = items
-    .filter((item) => item.pubDate && new Date(item.pubDate) > cutoff)
-    .reverse();
+  const newEntries = changes
+    .filter((c) => c.timestamp && new Date(c.timestamp) > cutoff)
+    .reverse(); // oldest first
 
   if (newEntries.length === 0) {
     console.log("No new edits in the last", LOOKBACK_MINUTES, "minutes.");
@@ -110,9 +92,9 @@ async function main() {
 
   console.log(`Found ${newEntries.length} new edit(s). Posting to Discord...`);
 
-  for (const item of newEntries) {
-    await postToDiscord(item);
-    console.log("Posted:", item.title);
+  for (const change of newEntries) {
+    await postToDiscord(change);
+    console.log("Posted:", change.title);
   }
 
   console.log("Done.");
