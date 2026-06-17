@@ -96,7 +96,11 @@ async function main() {
   let feed;
 
   try {
-    feed = await parser.parseURL(RSS_URL);
+    feed = await parser.parseURL(RSS_URL, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; VVWikiNotifier/1.0)"
+      }
+    });
   } catch (err) {
     console.error("Failed to fetch RSS feed:", err.message);
     process.exit(1);
